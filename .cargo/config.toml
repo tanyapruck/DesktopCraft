@@ -1,0 +1,4 @@
+# Portable Windows x64 build. Avoid depending on VCRUNTIME140.dll,
+# which is not necessarily installed on another Windows PC.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

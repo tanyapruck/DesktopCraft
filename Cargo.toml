@@ -1,0 +1,42 @@
+[package]
+name = "desktopcraft"
+version = "0.1.0"
+edition = "2021"
+# The product. The lab programs below are opt-in (`--features native-lab`).
+default-run = "desktopcraft"
+
+[features]
+profile-alloc = []
+native-lab = []
+
+[dependencies]
+macroquad = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser", "shellapi", "commdlg", "shlobj", "combaseapi", "objbase", "processthreadsapi", "wingdi", "winreg", "libloaderapi", "winerror", "winnt", "handleapi"] }
+
+[patch.crates-io]
+miniquad = { path = "vendor/miniquad" }
+# Local fork for accumulating high-resolution Windows mouse wheel events;
+# never modify the checksummed registry copy in vendor/crates.
+macroquad = { path = "vendor/macroquad" }
+
+[[bin]]
+name = "desktopcraft"
+path = "src/main.rs"
+
+[[bin]]
+name = "native-box-sandbox"
+path = "src/bin/native_box_sandbox.rs"
+required-features = ["native-lab"]
+
+[[bin]]
+name = "native-box-macroquad-lab"
+path = "src/bin/native_box_macroquad_lab.rs"
+required-features = ["native-lab"]
+
+[profile.release]
+opt-level = 2
+

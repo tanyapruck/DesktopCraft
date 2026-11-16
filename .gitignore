@@ -1,0 +1,40 @@
+# Build and local state
+.serena/
+target/
+app/target/
+data/
+demo/
+checks/
+shots/
+dist/
+.cargo-home/
+.env
+.env.*
+*.exe
+*.pdb
+*.dmp
+*.log
+*.zip
+*.7z
+*.msi
+*.png
+*.jpg
+*.jpeg
+*.webp
+# Private investigation and external material
+analysis/
+reference/
+attachments/
+capture/
+inbox/
+pinned/
+craft.json
+transcript.json
+feed.json
+usage.json
+agent-session.jsonl
+mechanics.json
+MECHANICS.md
+VERIFICATION.md
+# Cargo patches are explicitly included; never vendor the registry mirror
+vendor/crates/
