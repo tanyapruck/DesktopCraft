@@ -14,9 +14,9 @@ permissions:
 jobs:
   windows-x64:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout DesktopCraft source
         uses: actions/checkout@v4
@@ -29,30 +29,80 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -LiteralPath Cargo.toml -Pattern '^version\s*=\s*"(\d+\.\d+\.\d+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          if ("v$version" -ne "${{ github.ref_name }}") { throw "Git tag and Cargo.toml version do not match" }
-      - name: Run unit tests
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "Git tag and Cargo version do not match" }
+      - name: Run Rust unit tests
         shell: pwsh
         run: cargo test --locked --release
-      - name: Compile Windows x64 release
+      - name: Build Windows x64 release
         shell: pwsh
         run: cargo build --locked --release
-      - name: Validate and package self-installer
+      - name: Package self-installing EXE
         shell: pwsh
         run: ./scripts/package-release.ps1 -Destination dist
-      - name: Upload Windows installer as workflow artifact
+      - name: Install .NET SDK and WiX Toolset
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install pinned WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 7.0.0
+          if ($LASTEXITCODE -ne 0) { throw 'WiX install failed' }
+          (Join-Path $env:USERPROFILE '.dotnet\tools') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build Windows MSI
+        shell: pwsh
+        run: ./scripts/package-msi.ps1 -Destination dist
+      - name: Smoke test MSI install and uninstall
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Select-String -LiteralPath Cargo.toml -Pattern '^version\s*=\s*"(\d+\.\d+\.\d+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $msi = (Resolve-Path "dist/desktopcraft-$version-windows-x64.msi").Path
+          $workspace = Join-Path $env:APPDATA 'DesktopCraft\ci-preserve-workspace.txt'
+          New-Item -ItemType Directory -Force -Path (Split-Path $workspace) | Out-Null
+          'KEEP_WORKSPACE' | Set-Content -LiteralPath $workspace
+          $log = Join-Path $env:TEMP 'desktopcraft-msi-install.log'
+          $install = Start-Process msiexec.exe -ArgumentList ('/i "' + $msi + '" /qn /norestart /L*v "' + $log + '"') -Wait -PassThru
+          if ($install.ExitCode -ne 0) { Get-Content -LiteralPath $log -Tail 70; throw "MSI install failed: $($install.ExitCode)" }
+          $installed = Join-Path $env:LOCALAPPDATA 'Programs\DesktopCraft\DesktopCraft.exe'
+          if (-not (Test-Path -LiteralPath $installed)) { throw 'MSI did not install the program' }
+          $actual = (Get-Item -LiteralPath $installed).VersionInfo.ProductVersion
+          if ($actual -ne "$version.0") { throw "Wrong product version: $actual" }
+          $uninstall = Start-Process msiexec.exe -ArgumentList ('/x "' + $msi + '" /qn /norestart') -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "MSI uninstall failed: $($uninstall.ExitCode)" }
+          if (Test-Path -LiteralPath $installed) { throw 'MSI uninstall left the executable behind' }
+          if ((Get-Content -LiteralPath $workspace -Raw).Trim() -ne 'KEEP_WORKSPACE') { throw 'MSI uninstall removed workspace data' }
+      - name: Generate SHA-256 checksums for both formats
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -Destination dist
+      - name: Upload private Windows installer artifacts
         uses: actions/upload-artifact@v4
         with:
           name: DesktopCraft-Windows-x64
           path: |
             dist/DesktopCraft-v*-Setup-x64.exe
+            dist/desktopcraft-*-windows-x64.msi
             dist/SHA256SUMS.txt
           if-no-files-found: error
-      - name: Publish release assets for a version tag
-        if: startsWith(github.ref, 'refs/tags/v')
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: windows-x64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download validated installers
+        uses: actions/download-artifact@v4
+        with:
+          name: DesktopCraft-Windows-x64
+          path: dist
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/DesktopCraft-v*-Setup-x64.exe
+            dist/desktopcraft-*-windows-x64.msi
             dist/SHA256SUMS.txt
           generate_release_notes: true
           fail_on_unmatched_files: true
