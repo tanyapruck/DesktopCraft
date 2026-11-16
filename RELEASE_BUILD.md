@@ -1,35 +1,50 @@
-# DesktopCraft 0.1.0 — GitHub source and Windows installer
+# DesktopCraft v0.1.0 — Windows build and distribution
 
-This repository is the DesktopCraft **v0.1.11 source snapshot**, refactored and intentionally renumbered as the start of the **0.1.0 release line**. Version **0.2.0** is developed separately. This is **not** the historical v0.1.0 source snapshot.
+DesktopCraft builds native Windows x64 executables from Rust. The current stable version is defined in `Cargo.toml`.
 
-## Build (Windows x64)
+## Build locally
 
-~~~powershell
+On Windows x64 with the stable Rust toolchain:
+
+```powershell
 cargo test --locked --release
 cargo build --locked --release
 ./scripts/package-release.ps1
-~~~
+```
 
-The resulting DesktopCraft-v0.1.0-Setup-x64.exe is the compiled executable renamed to activate its built-in self-installer. Installing/updating is per-user, without administrator rights, and preserves Workspace, Boxes, Pages, Rules, Settings, and start-at-sign-in preference.
+For an MSI, install the WiX Toolset command-line tool (version 7.0.0 with the .NET 8 SDK) and run:
 
-**Unsigned installer:** Windows may show a SmartScreen warning. No claim is made that the installer is code-signed or trusted by SmartScreen.
+```powershell
+./scripts/package-msi.ps1
+./scripts/package-release.ps1  # refreshes SHA256SUMS.txt to include the MSI
+```
 
-## GitHub Actions and Releases
+## Release files
 
-The **Windows installer** workflow runs tests, builds with stable Rust on a GitHub Windows runner, checks version resources, and uploads the installer and SHA256SUMS.txt. A matching version tag (for example v0.1.0) additionally publishes a GitHub Release. A tag differing from the Cargo version is rejected.
+- `DesktopCraft-v<version>-Setup-x64.exe`: standalone self-installer for the current Windows user.
+- `desktopcraft-<version>-windows-x64.msi`: Windows Installer format prepared for ArtCraft compatibility testing. It uses per-user installation and is intended for a clean installation, not on top of the standalone EXE.
+- `SHA256SUMS.txt`: SHA-256 integrity manifest for the installer assets.
 
-## Version check and approved in-place updates
+The signed-in user's workspace data is stored outside the installed program directory and is retained when an MSI is uninstalled. The MSI refuses to overwrite an existing standalone installation to prevent conflicting installer ownership.
 
-The installed application checks the latest stable release from [GitHub Releases](https://github.com/tanyapruck/DesktopCraft/releases) asynchronously. If a newer release has the correctly named installer and SHA256SUMS.txt, the application prompts the user.
+## GitHub Actions
 
-After a user clicks **Yes**, the application downloads both assets in the background, checks the installer size and SHA-256, then launches its existing in-place installer with the approved-update flag. No silent installation or downgrades. Errors do not change the installed program.
+`.github/workflows/windows-installer.yml` runs Rust tests, builds the executable, packages an EXE and MSI, and smoke-tests MSI install/uninstall on a disposable Windows runner.
 
-The version checker does not run in local development builds or screenshot/self-test mode. Set DESKTOPCRAFT_DISABLE_UPDATE_CHECK=1 to disable checking on installed builds.
+Successful runs upload the assets to GitHub Actions artifacts. Only pushing a matching `vX.Y.Z` tag publishes a GitHub Release; normal pushes and Pull Requests do not publish release packages.
 
-## Performance refactor
+## Update behavior
 
-The icon GPU-upload loop now processes at most two decoded icons per frame, using a short time budget to smooth frame-time spikes. The worker continues extracting icons in the background. This prioritizes UI responsiveness while icons populate; it does not assert faster total startup or change on-disk file operations.
+The installed standalone app checks the latest GitHub Release asynchronously and prompts before installing any newer version. It verifies the asset size and published SHA-256 checksum before launching the approved update. It does not silently install updates or downgrade.
 
-## Source publication cautions
+**Private beta limitation:** The current updater uses unauthenticated GitHub requests and therefore cannot read releases in a private repository. Invited beta testers must download newer installers manually. No GitHub access tokens are embedded in DesktopCraft.
 
-Third-party Macroquad and Miniquad fork notices and license files are retained in vendor/. Verify redistribution/provenance and rights to all assets before broader distribution. No user workspace, logs, personal paths, proprietary investigation artifacts, or archived installer are part of this source repository.
+The Windows MSI is a separate install mechanism; it must be updated with a newer compatible MSI and is not intended to be overwritten by the EXE updater.
+
+## Readiness
+
+Before inviting additional testers or requesting official ArtCraft Launcher inclusion, review executable signing, code and asset provenance, real Windows install/uninstall/upgrade behavior, antivirus alerts, Explorer integration and the differing EXE/MSI migration paths.
+
+The Windows installer files are unsigned, and SmartScreen may display a warning. The product does not claim official ArtCraft branding or endorsement.
+
+See [Private beta guide](docs/PRIVATE_BETA.md) and [ArtCraft submission preparation](docs/ARTCRAFT_SUBMISSION.md).

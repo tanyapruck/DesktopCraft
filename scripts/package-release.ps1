@@ -16,8 +16,15 @@ New-Item -ItemType Directory -Force -Path $Destination | Out-Null
 $filename = "DesktopCraft-v$version-Setup-x64.exe"
 $installer = Join-Path $Destination $filename
 Copy-Item -LiteralPath $release -Destination $installer -Force
-$sha = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
-[IO.File]::WriteAllText((Join-Path $Destination 'SHA256SUMS.txt'), "$sha  $filename" + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
-Write-Output "GitHub installer ready: $installer"
-Write-Output "SHA-256: $sha"
+# When an MSI has already been built, include it in the same checksum list.
+$msi = Join-Path $Destination "desktopcraft-$version-windows-x64.msi"
+$artifacts = @($installer)
+if (Test-Path -LiteralPath $msi) { $artifacts += $msi }
+$hashLines = foreach ($path in ($artifacts | Sort-Object)) {
+    $sha = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
+    "$sha  $([IO.Path]::GetFileName($path))"
+}
+[IO.File]::WriteAllText((Join-Path $Destination 'SHA256SUMS.txt'), (($hashLines -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+Write-Output "Release assets ready in: $Destination"
+$hashLines | ForEach-Object { Write-Output $_ }
 Write-Output 'Note: unsigned self-installer; it may trigger Microsoft SmartScreen.'

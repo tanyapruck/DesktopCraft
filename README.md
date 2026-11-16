@@ -78,6 +78,8 @@ GitHub Actions also builds and tests the Windows installer. Release tags matchin
 
 For the packaging and updater implementation, see [Release build documentation](RELEASE_BUILD.md).
 
+**Private beta:** Invited GitHub collaborators can download builds from Releases or Actions. The in-app updater cannot access private GitHub releases without authentication; use the [private beta guide](docs/PRIVATE_BETA.md) for manual update instructions.
+
 ## License and acknowledgements
 
 DesktopCraft source is provided under the [MIT License](LICENSE). Third-party components, including locally adapted Macroquad and Miniquad code, retain their respective licenses and notices; see [NOTICE.md](NOTICE.md).
