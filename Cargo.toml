@@ -1,6 +1,6 @@
 [package]
 name = "desktopcraft"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 license = "MIT"
 # The product. The lab programs below are opt-in (`--features native-lab`).
