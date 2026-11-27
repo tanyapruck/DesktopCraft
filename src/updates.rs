@@ -116,11 +116,43 @@ fn github_cli_latest_release() -> Result<Option<Release>, String> {
     Ok(parse_github_cli_release(&output))
 }
 
+pub const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 pub enum Event {
     Available(Release),
+    Current,
     Ready(PathBuf),
     Failure(String),
 }
+
+pub enum UiState {
+    Disabled,
+    Idle,
+    Checking,
+    Current,
+    Available(Release),
+    Downloading,
+    Ready(PathBuf),
+    Failed(String),
+}
+impl UiState {
+    pub fn can_check(&self) -> bool {
+        matches!(self, Self::Idle | Self::Current | Self::Available(_) | Self::Failed(_))
+    }
+    pub fn header(&self) -> &'static str {
+        match self {
+            Self::Disabled => "Updates",
+            Self::Checking => "Checking...",
+            Self::Available(_) => "Update available",
+            Self::Downloading => "Downloading...",
+            Self::Ready(_) => "Install update",
+            _ => "Check for update",
+        }
+    }
+}
+#[derive(Clone, Copy)]
+pub enum Action { Check, Download, Install }
+
 pub struct Client {
     tx: Sender<Event>,
     rx: Receiver<Event>,
@@ -130,32 +162,37 @@ impl Client {
         if std::env::var_os("DESKTOPCRAFT_DISABLE_UPDATE_CHECK").is_some() {
             return None;
         }
-        // Never contact GitHub from tests, a portable executable, or the setup file.
+        // Store/MSIX, portable and setup builds are not self-updated.
         let current = std::env::current_exe().ok()?;
         let installed = crate::host::install_dir().join("DesktopCraft.exe");
         if !current.to_string_lossy().eq_ignore_ascii_case(&installed.to_string_lossy()) {
             return None;
         }
         let (tx, rx) = mpsc::channel();
-        let checking = tx.clone();
-        let _ = thread::Builder::new()
-            .name("desktopcraft-release-check".into())
-            .spawn(move || {
-                if let Ok(Some(release)) = latest_release() {
-                    if crate::host::version_newer(&release.version, env!("CARGO_PKG_VERSION")) {
-                        let _ = checking.send(Event::Available(release));
-                    }
-                }
-                // No release, network failure or a not-newer release are all nonfatal.
-            });
         Some(Self { tx, rx })
+    }
+    pub fn check(&self) {
+        let tx = self.tx.clone();
+        let failed = self.tx.clone();
+        if thread::Builder::new().name("desktopcraft-release-check".into()).spawn(move || {
+            let event = match latest_release() {
+                Ok(Some(release)) if crate::host::version_newer(&release.version, env!("CARGO_PKG_VERSION")) => Event::Available(release),
+                Ok(Some(_)) => Event::Current,
+                Ok(None) => Event::Failure("No verified release metadata was found.".into()),
+                Err(reason) => Event::Failure(reason),
+            };
+            let _ = tx.send(event);
+        }).is_err() {
+            let _ = failed.send(Event::Failure("Could not start update check.".into()));
+        }
     }
     pub fn poll(&self) -> Option<Event> {
         self.rx.try_recv().ok()
     }
     pub fn download(&self, release: Release) {
         let tx = self.tx.clone();
-        let _ = thread::Builder::new()
+        let failed = self.tx.clone();
+        if thread::Builder::new()
             .name("desktopcraft-update-download".into())
             .spawn(move || {
                 let result = download_verified(&release);
@@ -163,9 +200,25 @@ impl Client {
                     Ok(path) => Event::Ready(path),
                     Err(message) => Event::Failure(message),
                 });
-            });
+            }).is_err() {
+            let _ = failed.send(Event::Failure("Could not start update download.".into()));
+        }
     }
 }
+
+#[cfg(test)]
+#[test]
+fn update_state_prevents_overlapping_operations() {
+    assert_eq!(CHECK_INTERVAL.as_secs(), 3600);
+    assert!(UiState::Idle.can_check());
+    assert!(UiState::Current.can_check());
+    assert!(UiState::Failed("network".into()).can_check());
+    assert!(!UiState::Disabled.can_check());
+    assert!(!UiState::Checking.can_check());
+    assert!(!UiState::Downloading.can_check());
+    assert!(!UiState::Ready(PathBuf::from("setup.exe")).can_check());
+}
+
 fn powershell(body: &str, args: &[&str]) -> Result<String, String> {
     use std::os::windows::process::CommandExt;
     // Fixed scripts with positional arguments: never interpolate server strings
