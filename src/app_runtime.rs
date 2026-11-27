@@ -1,5 +1,38 @@
 use crate::*;
 
+/// A recovery report is evidence, not permission to reattach by itself.
+/// Do not restart after unknown worker failures, partial rollback or timeouts.
+#[cfg(windows)]
+fn verified_native_rebind_report(report: &serde_json::Value, topology_changed: bool) -> bool {
+    report["callback_detached"] == true
+        && report["native_in_box_positions_restored"] == true
+        && if topology_changed {
+            report["native_monitor_extension_auto_recovered"] == true
+        } else {
+            report["native_policy_lease_rebind_required"] == true
+        }
+}
+
+#[cfg(all(windows, test))]
+#[test]
+fn rebind_requires_a_verified_recovery_for_the_actual_trigger() {
+    let mut report = serde_json::json!({
+        "callback_detached":true, "native_in_box_positions_restored":true,
+        "native_monitor_extension_auto_recovered":true,
+        "native_policy_lease_rebind_required":false
+    });
+    assert!(verified_native_rebind_report(&report, true));
+    assert!(!verified_native_rebind_report(&report, false));
+    report["native_policy_lease_rebind_required"] = true.into();
+    assert!(verified_native_rebind_report(&report, false));
+    report["callback_detached"] = false.into();
+    assert!(!verified_native_rebind_report(&report, true));
+    report["callback_detached"] = true.into();
+    report["native_in_box_positions_restored"] = false.into();
+    assert!(!verified_native_rebind_report(&report, false));
+    assert!(!verified_native_rebind_report(&serde_json::json!({}), true));
+}
+
 pub(super) async fn run() {
     let args: Vec<String> = std::env::args().collect();
     let option = |name: &str| {
@@ -653,9 +686,15 @@ pub(super) async fn run() {
     // a real desktop may have none yet).
     let mut harness = test.as_ref().map(|_| verification::Harness::new(&app));
     #[cfg(windows)]
-    let updater = if desktop_mode && !automation && !native_chrome_preview {
+    let updater = if desktop_mode && !automation && (!native_chrome_preview || native_desktop_mode) {
         updates::Client::start()
     }else{None};
+    #[cfg(windows)]
+    let mut last_update_check: Option<std::time::Instant> = None;
+    #[cfg(windows)]
+    if updater.is_some() {
+        app.update_state = updates::UiState::Idle;
+    }
     #[cfg(windows)]
     if native_desktop_mode && !automation {
         start_native_crash_watch();
@@ -783,6 +822,8 @@ pub(super) async fn run() {
         None
     };
     let mut native_display_checked_at=std::time::Instant::now();
+    #[cfg(windows)]
+    let mut last_native_rebind_attempt: Option<std::time::Instant> = None;
     // Real Native Desktop changes are acknowledged by the Explorer layout
     // worker as one transaction. This is the last accepted in-memory State
     // to restore if the user's Header/Page/Rollup edit is refused.
@@ -886,6 +927,100 @@ pub(super) async fn run() {
             }
             app.host_exit();
             break;
+        }
+        // Handle an idle native session's display change or expired lease
+        // BEFORE collecting input or accepting any new Explorer commands.
+        // On an unsafe/ambiguous transition keep the existing fail-open exit.
+        #[cfg(windows)]
+        if native_desktop_mode && !automation && native_save_permitted
+            && native_acceptance_deadline.is_none()
+            && !(cfg!(debug_assertions)
+                && std::env::var_os("DESKTOPCRAFT_NATIVE_TEST_MAIN_MONITOR_CHANGED")
+                    .is_some_and(|v| v == "1"))
+            && app.state.prefs.desktop_enabled
+            && !app.host.as_ref().is_some_and(|h| h.quit)
+            && !is_quit_requested() {
+            let worker_stopped = native_two_box_worker.as_ref().is_some_and(|w| !w.is_ready());
+            let due = native_display_checked_at.elapsed() >= std::time::Duration::from_secs(1);
+            let observed = if worker_stopped || due {
+                Some(host::signature(&host::monitors()))
+            } else { None };
+            if due { native_display_checked_at = std::time::Instant::now(); }
+            let topology_changed = observed.as_ref().is_some_and(|now|
+                native_display_baseline.as_ref().is_some_and(|old| now != old));
+            if topology_changed || worker_stopped {
+                let idle = app.drag.is_none() && app.dialog.is_none()
+                    && app.menu.is_none() && app.folder_sort_menu.is_none()
+                    && app.minimized_settings.is_none() && !app.peek
+                    && !app.native_tx_inflight && app.native_ghost.is_none()
+                    && native_pending_ui.is_none() && native_header_reply.is_none()
+                    && native_rules_sort_reply.is_none() && native_layout_restore_reply.is_none()
+                    && native_pending_layout_followup.is_none() && native_stage2_layout_followup.is_none()
+                    && native_pin_paths_reply.is_none() && native_pending_pin_paths_toast.is_none()
+                    && !native_pending_sort_followup && native_pending_drop_commit.is_none()
+                    && app.native_rules_sort_requested.is_none() && app.native_layout_restore_requested.is_none()
+                    && app.native_pin_paths_requested.is_none() && app.native_ai_pending.is_none()
+                    && app.native_undo_inflight.is_none() && app.native_record_undo_on_sync.is_none()
+                    && app.desktop_toggle_requested.is_none()
+                    && native_last_accepted_state.as_ref().is_some_and(|accepted|
+                        !native_effective_sync_needed(accepted, native_last_accepted_revealed,
+                            native_last_accepted_hidden, &app.state, app.revealed, app.hidden));
+                let cooled_down = last_native_rebind_attempt.is_none_or(|at|
+                    at.elapsed() >= std::time::Duration::from_secs(10));
+                if idle && cooled_down && observed.as_ref().is_some_and(|s| !s.is_empty())
+                    && native_two_box_worker.is_some() {
+                    last_native_rebind_attempt = Some(std::time::Instant::now());
+                    host::set_native_quick_hide(false);
+                    let _ = host::take_native_quick_hide();
+                    #[cfg(feature = "native-release")]
+                    { native_window_drops = None; }
+                    let region_cleared = host::set_region(&[]);
+                    if let Some(h) = app.host.as_mut() {
+                        h.region.clear();
+                        if h.front { host::set_front(false); h.front = false; }
+                    }
+                    app.sync_native_backdrop(false, None, false);
+                    let report = native_two_box_worker.take().unwrap().shutdown();
+                    host::event("INFO", "native_desktop.rebind_checkpoint", &report.to_string());
+                    let journal = host::data_dir().join("native-inbox-recovery.json");
+                    let policy = native_filter_host::native_policy_status();
+                    if region_cleared && verified_native_rebind_report(&report, topology_changed)
+                        && !journal.exists() && policy["mapping_absence_confirmed"] == true
+                        && observed.as_ref().is_some_and(|s| s == &host::signature(&host::monitors())) {
+                        app.clear_native_scroll_state();
+                        app.native_ghost = None;
+                        app.native_box_ghosts.clear();
+                        app.native_visible_loose_rects = std::sync::Arc::from([]);
+                        match try_enable_native_desktop(
+                            &mut app, native_save_permitted, &mut native_disk_state,
+                            &mut native_last_accepted_state, &mut native_last_accepted_revealed,
+                            &mut native_last_accepted_hidden, &mut last_saved_state,
+                            &mut last_seen_state, &mut native_display_baseline, get_time(),
+                        ) {
+                            Ok(worker) => {
+                                native_two_box_worker = Some(worker);
+                                #[cfg(feature = "native-release")]
+                                { native_window_drops = native_drop::NativeWindowDropReceiver::register(host::window()).ok(); }
+                                native_display_checked_at = std::time::Instant::now();
+                                host::event("INFO", "native_desktop.rebind_ready",
+                                    "Fresh Explorer binding verified after recovery");
+                            }
+                            Err(reason) => {
+                                host::event("WARN", "native_desktop.rebind_refused", &reason);
+                                if let Some(h) = app.host.as_mut() { h.quit = true; }
+                            }
+                        }
+                    } else {
+                        host::event("WARN", "native_desktop.rebind_refused",
+                            "Detach, exact recovery or stable display preflight not verified");
+                        if let Some(h) = app.host.as_mut() { h.quit = true; }
+                    }
+                } else if topology_changed {
+                    host::event("WARN", "native_chrome.monitor_changed",
+                        "Monitor topology changed during an unsafe or repeated transition; exiting safely");
+                    if let Some(h) = app.host.as_mut() { h.quit = true; }
+                }
+            }
         }
         #[cfg(feature = "profile-alloc")]
         let allocation_start = alloc_profile::snapshot();
@@ -1396,39 +1531,59 @@ pub(super) async fn run() {
         }
         #[cfg(windows)]
         if let Some(updater) = &updater {
+            use updates::{Action, Event, UiState};
             while let Some(event) = updater.poll() {
-                match event {
-                    updates::Event::Available(release) => {
-                        if host::ask_default_no(&format!(
-                            "DesktopCraft {} is available on GitHub.\n\nCurrent version: {}\n\nDownload, verify, and update now? Your Boxes, Pages and Settings will be kept.",
-                            release.version, env!("CARGO_PKG_VERSION")
-                        )) {
-                            app.notify("Downloading the new DesktopCraft version...", input.time);
-                            updater.download(release);
-                        }
-                    }
-                    updates::Event::Ready(installer) => {
-                        // The verified Setup waits until this exact running
-                        // DesktopCraft instance has exited and the native
-                        // recovery journal is gone. Request normal GUI exit:
-                        // this detaches Explorer hooks and restores icons.
+                app.update_state = match event {
+                    Event::Available(release) => UiState::Available(release),
+                    Event::Current => UiState::Current,
+                    Event::Ready(installer) => UiState::Ready(installer),
+                    Event::Failure(error) => UiState::Failed(error),
+                };
+                app.settings_last_paint = 0.;
+            }
+            let action = app.update_action.take();
+            let due = last_update_check.is_none_or(|last| last.elapsed() >= updates::CHECK_INTERVAL);
+            if app.update_state.can_check()
+                && (matches!(action, Some(Action::Check)) || (due && action.is_none())) {
+                last_update_check = Some(std::time::Instant::now());
+                app.update_state = UiState::Checking;
+                app.settings_last_paint = 0.;
+                updater.check();
+            } else if matches!(action, Some(Action::Download)) {
+                if let UiState::Available(release) = &app.update_state {
+                    updater.download(release.clone());
+                    app.update_state = UiState::Downloading;
+                    app.settings_last_paint = 0.;
+                }
+            } else if matches!(action, Some(Action::Install)) {
+                if let UiState::Ready(installer) = &app.update_state {
+                    let idle = app.drag.is_none() && !app.native_tx_inflight
+                        && app.native_ai_pending.is_none() && native_pending_ui.is_none()
+                        && native_header_reply.is_none() && native_rules_sort_reply.is_none()
+                        && native_layout_restore_reply.is_none() && native_pin_paths_reply.is_none()
+                        && native_pending_layout_followup.is_none() && native_stage2_layout_followup.is_none()
+                        && native_pending_drop_commit.is_none() && !native_pending_sort_followup
+                        && app.host.as_ref().is_some_and(|h| !h.quit) && !is_quit_requested();
+                    if !idle {
+                        app.notify("Finish the current desktop action before installing.", input.time);
+                    } else {
+                        // Preserve the installer rollback barrier; never replace the
+                        // application while its native Explorer policy is attached.
                         match std::process::Command::new(installer)
                             .args(["--install", "--approved-update", "--wait-for-app-rollback"])
                             .spawn()
                         {
                             Ok(_) => {
-                                host::event("INFO","update.verified_installer_started",
+                                host::event("INFO", "update.verified_installer_started",
                                     "requesting graceful app exit before installer replaces executable");
-                                if let Some(host)=app.host.as_mut(){
-                                    host.quit=true;
-                                }else{
-                                    app.notify("Close DesktopCraft to complete the verified update.",input.time);
-                                }
+                                if let Some(host) = app.host.as_mut() { host.quit = true; }
                             }
-                            Err(_) => app.notify("Could not start the verified installer", input.time),
+                            Err(_) => {
+                                app.update_state = UiState::Failed("Could not start the verified installer.".into());
+                                app.settings_last_paint = 0.;
+                            }
                         }
                     }
-                    updates::Event::Failure(error) => app.notify(error, input.time),
                 }
             }
         }

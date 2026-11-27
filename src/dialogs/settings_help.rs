@@ -100,3 +100,40 @@ impl App {
         }
     }
 }
+
+#[cfg(windows)]
+impl App {
+    pub(super) fn settings_page_updates(&mut self, p: &mut Painter, x: f32, y: f32, w: f32) {
+        use updates::{Action, UiState};
+        p.text("Software updates", x, y, 24., TEXT);
+        p.text(&format!("Installed version: v{}", env!("CARGO_PKG_VERSION")), x, y + 48., 15., MUTED);
+        let (heading, detail) = match &self.update_state {
+            UiState::Disabled => ("Managed outside DesktopCraft".to_string(), "Use Microsoft Store or download the installer from GitHub.".to_string()),
+            UiState::Idle => ("Check for updates".to_string(), "Check the official DesktopCraft GitHub release.".to_string()),
+            UiState::Checking => ("Checking for updates...".to_string(), "Contacting GitHub.".to_string()),
+            UiState::Current => ("You're up to date".to_string(), "No newer verified release was found.".to_string()),
+            UiState::Available(r) => (format!("DesktopCraft v{} is available", r.version), format!("Download size: {:.1} MB", r.size as f64 / 1_000_000.0)),
+            UiState::Downloading => ("Downloading and verifying...".to_string(), "Checking installer size and SHA-256 checksum.".to_string()),
+            UiState::Ready(_) => ("Update ready to install".to_string(), "DesktopCraft will close safely before installing.".to_string()),
+            UiState::Failed(reason) => ("Update check or download failed".to_string(), reason.clone()),
+        };
+        let panel = Bounds { x, y: y + 95., w, h: 190. };
+        round(panel, 8., alpha(WHITE, 0.06));
+        p.text(&p.fit(&heading, 20., w-36.), x+18., y+115., 20., TEXT);
+        p.text(&p.fit(&detail, 13., w-36.), x+18., y+155., 13., MUTED);
+        let action = match &self.update_state {
+            UiState::Available(_) => Some(("Download update", Action::Download)),
+            UiState::Ready(_) => Some(("Install & restart", Action::Install)),
+            state if state.can_check() => Some(("Check for update", Action::Check)),
+            _ => None,
+        };
+        if let Some((label, action)) = action {
+            if p.button(label, Bounds { x: x+18., y: y+216., w: 210., h: 38. }, true) {
+                self.update_action = Some(action);
+            }
+        }
+        p.text("Automatic checks: every hour for installed GitHub builds.", x, y+316., 14., MUTED);
+        p.text("Updates require your approval. Your workspace is retained.", x, y+345., 14., MUTED);
+        p.text("GitHub installers are unsigned; Windows may show a warning.", x, y+374., 14., MUTED);
+    }
+}

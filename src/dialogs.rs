@@ -91,7 +91,7 @@ impl App {
             let header = Bounds {
                 x: b.x + 12.,
                 y: b.y + 5.,
-                w: b.w - 105.,
+                w: b.w - if cfg!(windows) { 290. } else { 105. },
                 h: 62.,
             };
             if input.pressed && header.contains(input.pos.x, input.pos.y) {
@@ -124,7 +124,7 @@ impl App {
             let header = Bounds {
                 x: b.x + 12.,
                 y: b.y + 5.,
-                w: b.w - 105.,
+                w: b.w - if cfg!(windows) { 290. } else { 105. },
                 h: 62.,
             };
             let start = if self.host.is_some() && !self.automation {
@@ -506,6 +506,18 @@ impl App {
                 target,
             } => {
                 p.text("Settings", b.x + 26., b.y + 21., 25., TEXT);
+                #[cfg(windows)]
+                if p.button(
+                    self.update_state.header(),
+                    Bounds { x: b.x + b.w - 276., y: b.y + 12., w: 182., h: 30. },
+                    matches!(&self.update_state, updates::UiState::Available(_) | updates::UiState::Ready(_)),
+                ) {
+                    *page = 11;
+                    self.settings_offset = 0;
+                    if matches!(&self.update_state, updates::UiState::Idle | updates::UiState::Current | updates::UiState::Failed(_)) {
+                        self.update_action = Some(updates::Action::Check);
+                    }
+                }
                 draw_line(
                     b.x + 194.,
                     b.y + 76.,
@@ -584,6 +596,8 @@ impl App {
                     7 => self.settings_page_pages(p, input, x, y, w, &mut close, &mut open_modal_from_settings),
                     9 => self.settings_page_displays(p, x, y, w),
                     8 => self.settings_page_peek(p, input, x, y, w),
+                    #[cfg(windows)]
+                    11 => self.settings_page_updates(p, x, y, w),
                     _ => self.settings_page_help(p, input, x, y, w),
                 }
             }

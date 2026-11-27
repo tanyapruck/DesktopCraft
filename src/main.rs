@@ -302,6 +302,10 @@ pub struct App {
     settings_minimize_requested: bool,
     desktop_toggle_requested: Option<bool>,
     #[cfg(windows)]
+    update_state: updates::UiState,
+    #[cfg(windows)]
+    update_action: Option<updates::Action>,
+    #[cfg(windows)]
     settings_last_paint: f64,
     #[cfg(windows)]
     settings_cursor_was_over: bool,

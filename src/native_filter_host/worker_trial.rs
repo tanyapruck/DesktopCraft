@@ -1,5 +1,21 @@
 use super::*;
 
+/// Match the DLL's uptime clock, including time spent suspended. Leave a
+/// margin before the five-second native policy lease expires.
+fn lease_gap_requires_rebind(now: u64, last: u64) -> bool {
+    last == 0 || now.checked_sub(last).is_none_or(|age| age >= 4000)
+}
+
+#[cfg(test)]
+#[test]
+fn suspended_worker_never_reuses_expired_lease() {
+    assert!(!lease_gap_requires_rebind(4999, 1000));
+    assert!(lease_gap_requires_rebind(5000, 1000));
+    assert!(lease_gap_requires_rebind(120000000, 1000));
+    assert!(lease_gap_requires_rebind(1000, 2000));
+    assert!(lease_gap_requires_rebind(1000, 0));
+}
+
 pub(super) fn run_native_hook_trial(seconds: u32, workspace: &std::path::Path,
                          dll_path: &std::path::Path,
                          experimental_single_index: Option<usize>,
@@ -498,7 +514,8 @@ pub(super) fn run_native_hook_trial_with_event(
             }
         }
     }
-    let initial_monitor_signature=crate::host::signature(&crate::host::monitors());
+    let initial_monitors=crate::host::monitors();
+    let initial_monitor_signature=crate::host::signature(&initial_monitors);
     if initial_monitor_signature.is_empty() {
         drop(panel);
         drop(controller);
@@ -582,6 +599,7 @@ pub(super) fn run_native_hook_trial_with_event(
     };
     let mut pending_icon_resize: Option<(((i32, i32), Option<i32>), std::time::Instant)> = None;
     let mut deferred_idle_poll = false;
+    let mut lease_rebind_required = false;
     for step in 0..cycles {
         let worker_step_started=std::time::Instant::now();
         let mut page_status=None;
@@ -594,6 +612,12 @@ pub(super) fn run_native_hook_trial_with_event(
             }else{
                 abort_reason=Some("Original UI requested native gesture worker shutdown".into());
             }
+            break;
+        }
+        if real_native_desktop && current_stage.is_some()
+            && unsafe { lease_gap_requires_rebind(GetTickCount64(), memory.lease_tick().load(Ordering::Acquire)) } {
+            lease_rebind_required = true;
+            abort_reason = Some("Native policy lease interrupted by suspend or stalled worker; require fresh binding".into());
             break;
         }
         if let Some(ref receiver) = two_box_ui_commands {
@@ -1259,7 +1283,13 @@ pub(super) fn run_native_hook_trial_with_event(
                                 if explorer_native::native_view_in_msaa_order(&fresh_items, &fresh_names).is_err() {
                                     let started = *inventory_retry_since.get_or_insert_with(std::time::Instant::now);
                                     if started.elapsed() < Duration::from_secs(3) {
-                                        unsafe { memory.renew_lease(); }
+                                        if lease_gap_requires_rebind(unsafe { GetTickCount64() },
+                                        unsafe { memory.lease_tick().load(Ordering::Acquire) }) {
+                                        lease_rebind_required = true;
+                                        abort_reason = Some("Native policy lease interrupted during inventory refresh; require fresh binding".into());
+                                        break;
+                                    }
+                                    unsafe { memory.renew_lease(); }
                                         std::thread::sleep(Duration::from_millis(50));
                                         continue;
                                     }
@@ -1325,7 +1355,13 @@ pub(super) fn run_native_hook_trial_with_event(
                                 Err(reason) => {
                                     let started = *inventory_retry_since.get_or_insert_with(std::time::Instant::now);
                                     if started.elapsed() < Duration::from_secs(3) {
-                                        unsafe { memory.renew_lease(); }
+                                        if lease_gap_requires_rebind(unsafe { GetTickCount64() },
+                                        unsafe { memory.lease_tick().load(Ordering::Acquire) }) {
+                                        lease_rebind_required = true;
+                                        abort_reason = Some("Native policy lease interrupted during inventory refresh; require fresh binding".into());
+                                        break;
+                                    }
+                                    unsafe { memory.renew_lease(); }
                                         std::thread::sleep(Duration::from_millis(50));
                                         continue;
                                     }
@@ -1407,6 +1443,12 @@ pub(super) fn run_native_hook_trial_with_event(
                             if real_native_desktop && attached && live_item_count(list) != Some(new_records.len()) {
                                 let started = *inventory_retry_since.get_or_insert_with(std::time::Instant::now);
                                 if started.elapsed() < Duration::from_secs(3) {
+                                    if lease_gap_requires_rebind(unsafe { GetTickCount64() },
+                                        unsafe { memory.lease_tick().load(Ordering::Acquire) }) {
+                                        lease_rebind_required = true;
+                                        abort_reason = Some("Native policy lease interrupted during inventory refresh; require fresh binding".into());
+                                        break;
+                                    }
                                     unsafe { memory.renew_lease(); }
                                     std::thread::sleep(Duration::from_millis(25));
                                     continue;
@@ -2754,7 +2796,11 @@ pub(super) fn run_native_hook_trial_with_event(
             }
         }
         if real_native_desktop &&
-            worker_step_started.elapsed()>=Duration::from_secs(4) {
+            (worker_step_started.elapsed()>=Duration::from_secs(4)
+                || (current_stage.is_some() && unsafe {
+                    lease_gap_requires_rebind(GetTickCount64(), memory.lease_tick().load(Ordering::Acquire))
+                })) {
+            lease_rebind_required = true;
             // The Explorer DLL's painting/input policy has a five-second
             // lease. After a blocked Shell COM call or modal context menu,
             // never silently renew an old generation that may have expired.
@@ -3314,11 +3360,44 @@ pub(super) fn run_native_hook_trial_with_event(
         }
     }
 
+    // An added display can leave every previously hidden icon at one
+    // shared park point. After verified detach, allow a narrowly scoped
+    // exact-ACK recovery only when all original monitors are unchanged.
+    // Never reuse the old hook or renew a stale generation.
+    let mut native_monitor_extension_auto_recovered=false;
+    if real_native_desktop && detach && native_layout_restore_error.is_some()
+        && crate::host::signature(&crate::host::monitors())!=initial_monitor_signature {
+        let observed=crate::host::monitors();
+        std::thread::sleep(Duration::from_millis(300));
+        let settled=crate::host::monitors();
+        if observed.len()==settled.len() && observed.iter().all(|m|settled.contains(m)) {
+            if let Some(fresh)=DesktopView::acquire() {
+                if desktop_owner(&fresh).ok()==Some(owner) {
+                    match crate::native_box_live_layout::automatic_recovery_after_monitor_extension(
+                        &fresh,&initial_monitors) {
+                        Ok(outcome) if outcome["monitor_extension_recovery"]==true
+                            && outcome["manual_restoration_performed"]==true
+                            && outcome["pending"]==false => {
+                            native_monitor_extension_auto_recovered=true;
+                            native_layout_restored=true;
+                            native_layout_restore_error=None;
+                            crate::host::event("INFO","native_desktop.monitor_extension_restored",
+                                "Detached filter; verified icon recovery after pure display extension");
+                        }
+                        Err(reason)=>crate::host::event("WARN",
+                            "native_desktop.monitor_extension_recovery_refused",&reason),
+                        _=>{}
+                    }
+                }
+            }
+        }
+    }
+
     // Explorer may complete an asynchronous paint/layout pass after the
     // native subclass is removed. Read back the REAL item positions until
     // they settle or the bounded deadline is reached. Never move them here.
     let baseline_after_detach = final_expected_baseline.as_deref().unwrap_or(&before);
-    let mut after=if native_explorer_restart_auto_recovered {
+    let mut after=if native_explorer_restart_auto_recovered || native_monitor_extension_auto_recovered {
         DesktopView::acquire()
             .map(|fresh|fresh.items()).unwrap_or_default()
     }else{view.items()};
@@ -3328,7 +3407,7 @@ pub(super) fn run_native_hook_trial_with_event(
     let mut post_detach_rechecks=0u32;
     while !same_positions && post_detach_started.elapsed()<Duration::from_secs(3){
         std::thread::sleep(Duration::from_millis(200));
-        after=if native_explorer_restart_auto_recovered {
+        after=if native_explorer_restart_auto_recovered || native_monitor_extension_auto_recovered {
             DesktopView::acquire()
                 .map(|fresh|fresh.items()).unwrap_or_default()
         }else{view.items()};
@@ -3429,6 +3508,8 @@ pub(super) fn run_native_hook_trial_with_event(
         "native_in_box_layout_generations":native_layout_generations,
         "native_in_box_positions_restored":native_layout_restored,
         "native_explorer_restart_auto_recovered":native_explorer_restart_auto_recovered,
+        "native_monitor_extension_auto_recovered":native_monitor_extension_auto_recovered,
+        "native_policy_lease_rebind_required":lease_rebind_required,
         "native_in_box_rollback_error":native_layout_restore_error,
         "native_in_box_recovery_journal":native_layout_journal,
         "native_two_box_ui_accepted_commands":ui_accepted_commands,
