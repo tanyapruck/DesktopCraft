@@ -26,3 +26,35 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --release --features native-fast-tabs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build verified installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $manifest = ./tools/build-native-candidate.ps1
+          $build = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
+          $out = Join-Path $env:RUNNER_TEMP 'desktopcraft-dist'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $setup = Join-Path $out 'DesktopCraft-v0.3.2-Setup-x64.exe'
+          Copy-Item -LiteralPath $build.artifact.executable -Destination $setup
+          $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $build.artifact.executable_sha256) { throw 'Installer hash mismatch' }
+          "$hash  DesktopCraft-v0.3.2-Setup-x64.exe" | Set-Content -LiteralPath (Join-Path $out 'SHA256SUMS.txt') -Encoding ascii
+          [ordered]@{
+            version = '0.3.2'
+            source_commit = $build.source_commit
+            source_tree = $build.source_tree
+            target = $build.target
+            features = $build.features
+            executable_sha256 = $hash
+            embedded_native_dll_sha256 = $build.artifact.native_dll_sha256
+            signed = $false
+            scope = 'Release candidate; automated tests, no physical monitor acceptance.'
+          } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $out 'build-provenance.json') -Encoding utf8
+          Write-Host "Installer SHA256: $hash"
+      - name: Upload verified installer candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: DesktopCraft-v0.3.2-Setup-x64
+          path: ${{ runner.temp }}/desktopcraft-dist/
+          if-no-files-found: error
+          retention-days: 30
