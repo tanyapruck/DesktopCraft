@@ -1,7 +1,7 @@
 name: Native recovery regression
 on:
   pull_request:
-    branches: [main]
+    branches: [main, fix/v0.3.2-native-recovery]
   workflow_dispatch:
 permissions:
   contents: read
@@ -37,13 +37,13 @@ jobs:
           $build = Get-Content -LiteralPath $manifest -Raw | ConvertFrom-Json
           $out = Join-Path $env:RUNNER_TEMP 'desktopcraft-dist'
           New-Item -ItemType Directory -Path $out -Force | Out-Null
-          $setup = Join-Path $out 'DesktopCraft-v0.3.3-Setup-x64.exe'
+          $setup = Join-Path $out 'DesktopCraft-v0.3.4-Setup-x64.exe'
           Copy-Item -LiteralPath $build.artifact.executable -Destination $setup
           $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($hash -ne $build.artifact.executable_sha256) { throw 'Installer hash mismatch' }
-          "$hash  DesktopCraft-v0.3.3-Setup-x64.exe" | Set-Content -LiteralPath (Join-Path $out 'SHA256SUMS.txt') -Encoding ascii
+          "$hash  DesktopCraft-v0.3.4-Setup-x64.exe" | Set-Content -LiteralPath (Join-Path $out 'SHA256SUMS.txt') -Encoding ascii
           [ordered]@{
-            version = '0.3.3'
+            version = '0.3.4'
             source_commit = $build.source_commit
             source_tree = $build.source_tree
             target = $build.target
@@ -57,41 +57,8 @@ jobs:
       - name: Upload verified installer candidate
         uses: actions/upload-artifact@v4
         with:
-          name: DesktopCraft-v0.3.3-Setup-x64
+          name: DesktopCraft-v0.3.4-Setup-x64
           path: ${{ runner.temp }}/desktopcraft-dist/
           if-no-files-found: error
           retention-days: 30
 
-  publish:
-    # Only the explicitly selected release branch in the owner repository.
-    # Never grant write access to a fork PR or publish on a failed build.
-    if: github.event_name == 'pull_request' && github.repository == 'tanyapruck/DesktopCraft' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref == 'fix/v0.3.2-native-recovery'
-    needs: windows
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    concurrency:
-      group: desktopcraft-v0.3.3-publish
-      cancel-in-progress: false
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: DesktopCraft-v0.3.3-Setup-x64
-          path: dist
-      - name: Verify artifact and publish GitHub Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          RELEASE_COMMIT: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum --check SHA256SUMS.txt
-          test "$(jq -r '.version' build-provenance.json)" = '0.3.3'
-          test "$(jq -r '.source_commit' build-provenance.json)" = "$RELEASE_COMMIT"
-          if gh release view v0.3.3 --repo "$GH_REPO" >/dev/null 2>&1; then
-            echo 'Release already exists; refusing to replace published assets.'
-            exit 1
-          fi
-          gh release create v0.3.3 DesktopCraft-v0.3.3-Setup-x64.exe SHA256SUMS.txt build-provenance.json --repo "$GH_REPO" --target "$RELEASE_COMMIT" --title "DesktopCraft v0.3.3" --latest --notes "Adds manual and hourly update checks, an update indicator next to Settings window controls, and an in-app update page with explicit download and install approval. Includes verified monitor-recovery and suspend-lease fixes from the 0.3.2 candidate. Windows automated build and regression tests passed before packaging. Physical monitor hot-plug and live installation are not independently validated. Installer is unsigned."
