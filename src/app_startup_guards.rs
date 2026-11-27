@@ -33,7 +33,7 @@ pub(super) fn update_install_safe_state(
 pub(super) fn update_install_quiescent() -> bool {
     update_install_safe_state(
         host::instance_running(),
-        host::data_dir().join("native-inbox-recovery.json").exists(),
+        !matches!(host::data_dir().join("native-inbox-recovery.json").try_exists(), Ok(false)),
         native_filter_host::native_policy_status()["mapping_absence_confirmed"]!=true,
     )
 }
