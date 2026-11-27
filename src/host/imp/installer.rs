@@ -284,6 +284,62 @@ fn installer_lock_reopens_a_read_only_file_and_excludes_a_live_holder() {
     reopened.unwrap();
 }
 
+// Windows can temporarily deny metadata access while the previous process
+// closes a journal, a filesystem filter scans it or deletion is pending.
+// An unknown state is never equivalent to a missing recovery journal.
+fn retryable_journal_error(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32 | 33 | 303))
+}
+
+fn probe_recovery_journal(
+    journal: &Path,
+    mut inspect: impl FnMut() -> std::io::Result<bool>,
+    mut retry: impl FnMut() -> bool,
+) -> Result<bool, String> {
+    loop {
+        match inspect() {
+            Ok(pending) => return Ok(pending),
+            Err(error) if retryable_journal_error(&error) && retry() => continue,
+            Err(error) => return Err(format!(
+                "Cannot inspect the native recovery journal at {}: {}. Close DesktopCraft normally and retry with the same Windows account; recovery data was not removed.",
+                journal.display(), error)),
+        }
+    }
+}
+
+fn inspect_recovery_journal_until(journal: &Path, deadline: std::time::Instant) -> Result<bool, String> {
+    probe_recovery_journal(journal, || journal.try_exists(), || {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() { return false; }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(200)));
+        true
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn installer_journal_retry_never_treats_access_denied_as_absent() {
+    use std::collections::VecDeque;
+    use std::io::Error;
+    let journal = Path::new("native-inbox-recovery.json");
+    let mut probes = VecDeque::from([Err(Error::from_raw_os_error(5)),
+        Err(Error::from_raw_os_error(32)), Err(Error::from_raw_os_error(303)), Ok(false)]);
+    let mut retries = 0;
+    assert!(!probe_recovery_journal(journal, || probes.pop_front().unwrap(),
+        || { retries += 1; true }).unwrap());
+    assert_eq!(retries, 3);
+    let mut probes = VecDeque::from([Err(Error::from_raw_os_error(5)), Ok(true)]);
+    assert!(probe_recovery_journal(journal, || probes.pop_front().unwrap(), || true).unwrap());
+    let mut retries = 0;
+    let result = probe_recovery_journal(journal, || Err(Error::from_raw_os_error(5)), || {
+        retries += 1; retries < 3
+    });
+    assert!(result.is_err());
+    assert_eq!(retries, 3);
+    assert!(probe_recovery_journal(journal, || Err(Error::from_raw_os_error(123)),
+        || panic!("invalid path must not be retried")).is_err());
+}
+
 /// All installer entry points (manual first upgrade included) are subject
 /// to the same live-Explorer safety barrier as the GitHub updater. No bytes
 /// or registry entries are touched until the previous UI exits, its
@@ -295,10 +351,11 @@ fn wait_for_installer_quiescence() -> Result<(),String> {
             format!("Cannot request orderly DesktopCraft shutdown: {e}"))?;
     }
     let started=std::time::Instant::now();
+    let deadline=started+std::time::Duration::from_secs(55);
     loop {
+        let pending=inspect_recovery_journal_until(&journal, deadline)?;
+        // The metadata probe may have waited while the former GUI exited.
         let running=instance_running();
-        let pending=journal.try_exists().map_err(|e|
-            format!("Cannot inspect the native recovery journal: {e}"))?;
         let policy=crate::native_filter_host::native_policy_status();
         if !running && !pending && policy["mapping_absence_confirmed"]==true {return Ok(());}
         if !running && pending {
@@ -570,7 +627,8 @@ pub fn install(start_at_login: bool) -> Result<InstallCommit, String> {
     let desktop_instance = claim_desktop_instance()
         .ok_or("DesktopCraft started during installer preflight; close it and retry")?;
     let journal = data_dir().join("native-inbox-recovery.json");
-    if journal.try_exists().map_err(|e| e.to_string())?
+    if inspect_recovery_journal_until(&journal,
+        std::time::Instant::now()+std::time::Duration::from_secs(5))?
         || crate::native_filter_host::native_policy_status()["mapping_absence_confirmed"] != true {
         return Err("Explorer detach and recovery could not be confirmed; installation refused".into());
     }
@@ -887,7 +945,8 @@ pub fn uninstall() -> Result<(), String> {
     let desktop_instance = claim_desktop_instance()
         .ok_or("DesktopCraft started during uninstall preflight; close it and retry")?;
     let journal = data_dir().join("native-inbox-recovery.json");
-    if journal.try_exists().map_err(|e| e.to_string())?
+    if inspect_recovery_journal_until(&journal,
+        std::time::Instant::now()+std::time::Duration::from_secs(5))?
         || crate::native_filter_host::native_policy_status()["mapping_absence_confirmed"] != true {
         return Err("Explorer detach and recovery could not be confirmed; uninstall refused".into());
     }
