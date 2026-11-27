@@ -30,6 +30,7 @@ pub(crate) use inventory::reconcile_desktop_inventory;
 pub(crate) use inventory::adopt_spacing_positions;
 pub use recovery::recovery_status_or_restore;
 pub use recovery::automatic_recovery_status_or_restore;
+pub(crate) use recovery::automatic_recovery_after_monitor_extension;
 pub use preflight::native_desktop_preflight;
 pub(crate) use grid::DesktopCoordinates;
 pub(crate) use grid::cell_for_point;
