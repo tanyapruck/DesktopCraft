@@ -1,7 +1,7 @@
 name: Native recovery regression
 on:
   pull_request:
-    branches: [main]
+    branches: [main, fix/v0.3.2-native-recovery]
   workflow_dispatch:
 permissions:
   contents: read
