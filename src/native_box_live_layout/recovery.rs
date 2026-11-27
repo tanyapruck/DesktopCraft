@@ -262,8 +262,62 @@ pub fn automatic_recovery_status_or_restore(view:&DesktopView,apply:bool)
     recovery_status_or_restore_policy(view,apply,true,false)
 }
 
+/// Only a pure extension is eligible: every previous monitor must retain its
+/// complete geometry, DPI, work area and primary role. No stale coordinate
+/// projection is permitted for disconnects, rearrangements or scale changes.
+fn pure_monitor_extension(before: &[host::Monitor], after: &[host::Monitor]) -> bool {
+    !before.is_empty() && after.len() > before.len()
+        && before.iter().filter(|m| m.primary).count() == 1
+        && after.iter().filter(|m| m.primary).count() == 1
+        && before.iter().all(|m| after.contains(m))
+        && before.iter().map(|m| &m.key).collect::<BTreeSet<_>>().len() == before.len()
+        && after.iter().map(|m| &m.key).collect::<BTreeSet<_>>().len() == after.len()
+}
+
+/// A removed secondary display can also use exact-coordinate recovery if
+/// every surviving display is unchanged and every destination is still on a
+/// connected work area. The destination preflight below is mandatory.
+fn safe_monitor_subset_change(before: &[host::Monitor], after: &[host::Monitor]) -> bool {
+    pure_monitor_extension(before, after) || pure_monitor_extension(after, before)
+}
+
+fn same_monitors(a: &[host::Monitor], b: &[host::Monitor]) -> bool {
+    a.len() == b.len() && a.iter().all(|m| b.contains(m))
+}
+
+fn visible_distinct_recovery_targets(
+    items: &[ViewItem], screens: &[host::Monitor], icon_size: i32,
+) -> bool {
+    if icon_size <= 0 { return false; }
+    let mut origins = BTreeSet::new();
+    items.iter().all(|item| {
+        let (x, y) = (i64::from(item.pos.0), i64::from(item.pos.1));
+        origins.insert(item.pos) && screens.iter().any(|m| {
+            let [left, top, width, height] = m.work.map(i64::from);
+            x >= left && y >= top
+                && x + i64::from(icon_size) <= left + width
+                && y + i64::from(icon_size) <= top + height
+        })
+    })
+}
+
+/// Called only by the worker after acknowledged detachment. A display
+/// extension must not strand every managed icon at the shared park point.
+pub(crate) fn automatic_recovery_after_monitor_extension(
+    view: &DesktopView, before: &[host::Monitor],
+) -> Result<Value, String> {
+    recovery_status_or_restore_impl(view, true, true, false, Some(before))
+}
+
 pub(super) fn recovery_status_or_restore_policy(
     view:&DesktopView,apply:bool,automatic:bool,reconcile_grid:bool)->Result<Value,String>{
+    recovery_status_or_restore_impl(view, apply, automatic, reconcile_grid, None)
+}
+
+fn recovery_status_or_restore_impl(
+    view:&DesktopView,apply:bool,automatic:bool,reconcile_grid:bool,
+    extension_from: Option<&[host::Monitor]>,
+)->Result<Value,String>{
     let journal=host::data_dir().join("native-inbox-recovery.json");
     if !journal.exists(){
         return Ok(json!({"pending":false,"restored":false,"journal_path":journal}));
@@ -271,8 +325,20 @@ pub(super) fn recovery_status_or_restore_policy(
     let bytes=std::fs::read(&journal).map_err(|e|e.to_string())?;
     let data:Value=serde_json::from_slice(&bytes)
         .map_err(|e|format!("Native recovery checkpoint invalid: {e}"))?;
-    if data["format"]!=1 || data["monitor_signature"]!=
-        host::signature(&host::monitors()){
+    let monitors = host::monitors();
+    let monitor_signature = host::signature(&monitors);
+    let extension = extension_from.is_some();
+    let topology_valid = match extension_from {
+        None => data["monitor_signature"] == monitor_signature,
+        Some(before) => automatic && apply && !reconcile_grid
+            && data["monitor_signature"] == host::signature(before)
+            && safe_monitor_subset_change(before, &monitors)
+            && data["explorer_pid_before"] == desktop_owner(view)?.pid
+            && view.icons_visible() == Some(true)
+            && data["original_snap_to_grid"].is_boolean()
+            && data["snap_to_grid"].as_bool().is_some_and(|snap| view.snap_to_grid() == Some(snap)),
+    };
+    if data["format"] != 1 || !topology_valid {
         return Err("Native recovery monitor/format mismatch; manual icon review required".into());
     }
     let originals=data["original_icons"].as_array()
@@ -368,6 +434,14 @@ pub(super) fn recovery_status_or_restore_policy(
     }
     let retained = retain_icons_with_occupied_restore_targets(&current, &mut moved);
     let expected_after = rollback_targets_clear(&current, &moved)?;
+    let extension_icon_size = if extension {
+        let size = view.icon_size().ok_or("Explorer icon size unavailable")?;
+        if !retained.is_empty()
+            || !visible_distinct_recovery_targets(&expected_after, &monitors, size) {
+            return Err("Extension recovery targets are occupied or outside connected work areas; journal retained".into());
+        }
+        Some(size)
+    } else { None };
     let mut restored=false;
     if apply{
         // Save the immediate pre-restore state in a second collision-safe
@@ -388,12 +462,34 @@ pub(super) fn recovery_status_or_restore_policy(
             }).map_err(|e|format!("Manual native recovery preimage not saved: {e}"))?;
         // Flush the preimage first, then recheck immediately before the COM
         // write so disk I/O does not widen the window for a user drag.
-        if host::signature(&host::monitors()) != data["monitor_signature"]
+        if !same_monitors(&monitors, &host::monitors())
+            || (extension && (view.icon_size() != extension_icon_size
+                || data["explorer_pid_before"] != desktop_owner(view)?.pid
+                || data["snap_to_grid"].as_bool() != view.snap_to_grid()))
             || (reconcile_grid && view.snap_to_grid() != Some(true))
             || !same_icon_positions(&view.items(), &current) {
             return Err("Explorer monitor layout or icon positions changed during recovery; no overwrite".into());
         }
-        if !moved.is_empty() && view.position(&moved)!=moved.len(){
+        if extension {
+            let mut checkpoint = current.clone();
+            for batch in order_rollback_batches(&current, &moved) {
+                if !same_monitors(&monitors, &host::monitors())
+                    || data["explorer_pid_before"] != desktop_owner(view)?.pid
+                    || view.icon_size() != extension_icon_size
+                    || data["snap_to_grid"].as_bool() != view.snap_to_grid()
+                    || !same_icon_positions(&view.items(), &checkpoint) {
+                    return Err("Display or Explorer changed during monitor recovery; journal retained".into());
+                }
+                if view.position(&batch) != batch.len() {
+                    return Err("Monitor recovery positioned fewer icons than requested; journal retained".into());
+                }
+                for item in &mut checkpoint {
+                    if let Some((_, pos)) = batch.iter().find(|(path,_)| item.path.eq_ignore_ascii_case(path)) {
+                        item.pos = *pos;
+                    }
+                }
+            }
+        } else if !moved.is_empty() && view.position(&moved)!=moved.len(){
             return Err("Manual native Explorer recovery positioned fewer icons than requested".into());
         }
         std::thread::sleep(Duration::from_millis(700));
@@ -401,8 +497,21 @@ pub(super) fn recovery_status_or_restore_policy(
         if !same_icon_positions(&after, &expected_after){
             return Err("Manual recovery was incomplete; original journal retained".into());
         }
+        if extension && (!same_monitors(&monitors, &host::monitors())
+            || data["explorer_pid_before"] != desktop_owner(view)?.pid) {
+            return Err("Display or Explorer changed after extension recovery; journal retained".into());
+        }
         if data["original_snap_to_grid"] == true && view.snap_to_grid() == Some(false) {
             let _ = view.set_snap_to_grid(true);
+        }
+        if extension {
+            std::thread::sleep(Duration::from_millis(200));
+            if !same_monitors(&monitors, &host::monitors())
+                || data["explorer_pid_before"] != desktop_owner(view)?.pid
+                || data["original_snap_to_grid"].as_bool() != view.snap_to_grid()
+                || !same_icon_positions(&view.items(), &expected_after) {
+                return Err("Extension recovery postflight not verified; journal retained".into());
+            }
         }
         std::fs::remove_file(&journal).map_err(|e|e.to_string())?;
         restored=true;
@@ -415,6 +524,7 @@ pub(super) fn recovery_status_or_restore_policy(
         "all_unclaimed_icons_unchanged":true,
         "loose_icon_user_positions_preserved":loose_moves_preserved,
         "monitor_identity_verified":true,
+        "monitor_extension_recovery":extension,
         "manual_restoration_performed":restored,
         "legacy_grid_snap_verified":recovered_checkpoint.is_some(),
         "no_workspace_or_disk_file_changes":true,
@@ -525,4 +635,82 @@ pub(super) fn reconcile_grid_checkpoint(
         return Err("No whole legacy Explorer grid adjustment to recover".into());
     }
     Ok(adjusted)
+}
+
+#[cfg(test)]
+mod extension_recovery_tests {
+    use super::*;
+    fn monitor(key: &str, x: i32, primary: bool) -> host::Monitor {
+        host::Monitor { key:key.into(), rect:[x,0,1920,1200],
+            work:[x,0,1920,1150], dpi:96, primary }
+    }
+    #[test]
+    fn only_unchanged_old_monitors_allow_extension() {
+        let main = monitor("DISPLAY1",0,true);
+        let extra = monitor("DISPLAY2",1920,false);
+        let before = vec![main.clone()];
+        assert!(pure_monitor_extension(&before, &[extra.clone(),main.clone()]));
+        assert!(!pure_monitor_extension(&before, &before));
+        assert!(!pure_monitor_extension(&before, &[extra.clone()]));
+        assert!(safe_monitor_subset_change(&[main.clone(), extra.clone()], &before));
+        assert!(!safe_monitor_subset_change(&[main.clone(), extra.clone()], &[extra.clone()]));
+        let mut scaled = main.clone();
+        scaled.dpi = 120;
+        assert!(!pure_monitor_extension(&before, &[scaled,extra.clone()]));
+        let mut moved = main.clone();
+        moved.rect[0] = -1920;
+        assert!(!pure_monitor_extension(&before, &[moved,extra.clone()]));
+        let mut work_changed = main.clone();
+        work_changed.work[3] -= 40;
+        assert!(!pure_monitor_extension(&before, &[work_changed,extra.clone()]));
+        let mut non_primary = main.clone();
+        non_primary.primary = false;
+        let mut new_primary = extra.clone();
+        new_primary.primary = true;
+        assert!(!pure_monitor_extension(&before, &[non_primary,new_primary]));
+    }
+    #[test]
+    fn extension_unparks_49_exactly_acknowledged_icons_without_touching_loose_icons() {
+        let screens = [monitor("DISPLAY1",0,true), monitor("DISPLAY2",1920,false)];
+        let mut original = vec![
+            ViewItem{path:"loose-a".into(),label:"loose-a".into(),pos:(27,2)},
+            ViewItem{path:"loose-b".into(),label:"loose-b".into(),pos:(122,2)},
+        ];
+        for n in 0..49 {
+            let path=format!("managed-{n}");
+            original.push(ViewItem{path:path.clone(),label:path,
+                pos:(407+(n/10)*95,104+(n%10)*102)});
+        }
+        let mut current=original.clone();
+        for item in &mut current[2..] { item.pos=(1809,987); }
+        let rows=|items:&[ViewItem]| items.iter().map(|i|
+            json!({"path":i.path,"label":i.label,"x":i.pos.0,"y":i.pos.1}))
+            .collect::<Vec<_>>();
+        let journal=json!({"auto_restore_requires_exact_ack":true,"last_ack_generation":3,
+            "original_icons":rows(&original),"last_verified_positions":rows(&current)});
+        let verified=verified_recovery_plan(&journal,&current).unwrap();
+        assert_eq!(verified.placed.len(),49);
+        let mut moves=original.iter().filter(|i|verified.placed.contains(&i.path))
+            .map(|i|(i.path.clone(),i.pos)).collect::<Vec<_>>();
+        assert!(retain_icons_with_occupied_restore_targets(&current,&mut moves).is_empty());
+        let expected=rollback_targets_clear(&current,&moves).unwrap();
+        assert!(same_icon_positions(&expected,&original));
+        assert!(visible_distinct_recovery_targets(&expected,&screens,48));
+        // A post-ACK move is not authority to restore or overwrite it.
+        current[2].pos=(1900,200);
+        assert!(verified_recovery_plan(&journal,&current).is_err());
+    }
+    #[test]
+    fn extension_recovery_refuses_stacked_or_offscreen_targets() {
+        let screens = [monitor("DISPLAY1",0,true), monitor("DISPLAY2",1920,false)];
+        let a = ViewItem{path:"A".into(),label:"A".into(),pos:(27,2)};
+        let mut b = ViewItem{path:"B".into(),label:"B".into(),pos:(1832,1022)};
+        assert!(visible_distinct_recovery_targets(&[a.clone(),b.clone()], &screens, 48));
+        b.pos = a.pos;
+        assert!(!visible_distinct_recovery_targets(&[a.clone(),b.clone()], &screens, 48));
+        b.pos = (2200,100);
+        assert!(!visible_distinct_recovery_targets(&[a.clone(),b.clone()], &screens[..1], 48));
+        b.pos = (3800,1140);
+        assert!(!visible_distinct_recovery_targets(&[a,b], &screens, 48));
+    }
 }
