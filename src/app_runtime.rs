@@ -686,9 +686,15 @@ pub(super) async fn run() {
     // a real desktop may have none yet).
     let mut harness = test.as_ref().map(|_| verification::Harness::new(&app));
     #[cfg(windows)]
-    let updater = if desktop_mode && !automation && !native_chrome_preview {
+    let updater = if desktop_mode && !automation && (!native_chrome_preview || native_desktop_mode) {
         updates::Client::start()
     }else{None};
+    #[cfg(windows)]
+    let mut last_update_check: Option<std::time::Instant> = None;
+    #[cfg(windows)]
+    if updater.is_some() {
+        app.update_state = updates::UiState::Idle;
+    }
     #[cfg(windows)]
     if native_desktop_mode && !automation {
         start_native_crash_watch();
@@ -1525,39 +1531,59 @@ pub(super) async fn run() {
         }
         #[cfg(windows)]
         if let Some(updater) = &updater {
+            use updates::{Action, Event, UiState};
             while let Some(event) = updater.poll() {
-                match event {
-                    updates::Event::Available(release) => {
-                        if host::ask_default_no(&format!(
-                            "DesktopCraft {} is available on GitHub.\n\nCurrent version: {}\n\nDownload, verify, and update now? Your Boxes, Pages and Settings will be kept.",
-                            release.version, env!("CARGO_PKG_VERSION")
-                        )) {
-                            app.notify("Downloading the new DesktopCraft version...", input.time);
-                            updater.download(release);
-                        }
-                    }
-                    updates::Event::Ready(installer) => {
-                        // The verified Setup waits until this exact running
-                        // DesktopCraft instance has exited and the native
-                        // recovery journal is gone. Request normal GUI exit:
-                        // this detaches Explorer hooks and restores icons.
+                app.update_state = match event {
+                    Event::Available(release) => UiState::Available(release),
+                    Event::Current => UiState::Current,
+                    Event::Ready(installer) => UiState::Ready(installer),
+                    Event::Failure(error) => UiState::Failed(error),
+                };
+                app.settings_last_paint = 0.;
+            }
+            let action = app.update_action.take();
+            let due = last_update_check.is_none_or(|last| last.elapsed() >= updates::CHECK_INTERVAL);
+            if app.update_state.can_check()
+                && (matches!(action, Some(Action::Check)) || (due && action.is_none())) {
+                last_update_check = Some(std::time::Instant::now());
+                app.update_state = UiState::Checking;
+                app.settings_last_paint = 0.;
+                updater.check();
+            } else if matches!(action, Some(Action::Download)) {
+                if let UiState::Available(release) = &app.update_state {
+                    updater.download(release.clone());
+                    app.update_state = UiState::Downloading;
+                    app.settings_last_paint = 0.;
+                }
+            } else if matches!(action, Some(Action::Install)) {
+                if let UiState::Ready(installer) = &app.update_state {
+                    let idle = app.drag.is_none() && !app.native_tx_inflight
+                        && app.native_ai_pending.is_none() && native_pending_ui.is_none()
+                        && native_header_reply.is_none() && native_rules_sort_reply.is_none()
+                        && native_layout_restore_reply.is_none() && native_pin_paths_reply.is_none()
+                        && native_pending_layout_followup.is_none() && native_stage2_layout_followup.is_none()
+                        && native_pending_drop_commit.is_none() && !native_pending_sort_followup
+                        && app.host.as_ref().is_some_and(|h| !h.quit) && !is_quit_requested();
+                    if !idle {
+                        app.notify("Finish the current desktop action before installing.", input.time);
+                    } else {
+                        // Preserve the installer rollback barrier; never replace the
+                        // application while its native Explorer policy is attached.
                         match std::process::Command::new(installer)
                             .args(["--install", "--approved-update", "--wait-for-app-rollback"])
                             .spawn()
                         {
                             Ok(_) => {
-                                host::event("INFO","update.verified_installer_started",
+                                host::event("INFO", "update.verified_installer_started",
                                     "requesting graceful app exit before installer replaces executable");
-                                if let Some(host)=app.host.as_mut(){
-                                    host.quit=true;
-                                }else{
-                                    app.notify("Close DesktopCraft to complete the verified update.",input.time);
-                                }
+                                if let Some(host) = app.host.as_mut() { host.quit = true; }
                             }
-                            Err(_) => app.notify("Could not start the verified installer", input.time),
+                            Err(_) => {
+                                app.update_state = UiState::Failed("Could not start the verified installer.".into());
+                                app.settings_last_paint = 0.;
+                            }
                         }
                     }
-                    updates::Event::Failure(error) => app.notify(error, input.time),
                 }
             }
         }
