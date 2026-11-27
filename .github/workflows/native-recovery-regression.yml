@@ -1,0 +1,28 @@
+name: Native recovery regression
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test native DLL
+        shell: pwsh
+        run: |
+          cargo test --locked --release --manifest-path native-filter/Cargo.toml --features native-fast-tabs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --release --manifest-path native-filter/Cargo.toml --features native-fast-tabs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test desktop host
+        shell: pwsh
+        run: |
+          $env:DESKTOPCRAFT_NATIVE_FILTER_DLL = (Resolve-Path native-filter/target/release/desktopcraft_native_filter.dll).Path
+          cargo test --locked --release --features native-fast-tabs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --release --features native-fast-tabs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
