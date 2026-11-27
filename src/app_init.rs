@@ -130,7 +130,11 @@ impl App {
             settings_bring_to_front: false,
             rendering_settings_window: false,
             settings_minimize_requested: false,
-            desktop_toggle_requested: None,
+            desktop_toggle_requested: None, 
+            #[cfg(windows)]
+            update_state: updates::UiState::Disabled,
+            #[cfg(windows)]
+            update_action: None,
             #[cfg(windows)]
             settings_last_paint: 0.,
             #[cfg(windows)]
